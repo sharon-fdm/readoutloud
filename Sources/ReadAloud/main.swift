@@ -1,5 +1,7 @@
 import AppKit
+import PDFKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 struct ReadAloudApp: App {
@@ -74,7 +76,7 @@ struct ContentView: View {
                 .overlay {
                     if model.sourceText.isEmpty {
                         ContentUnavailableView(
-                            "Open a Text or Markdown File",
+                            "Open a Text, Markdown, or PDF File",
                             systemImage: "doc.text",
                             description: Text("Load a file, place the cursor anywhere in the rendered text, then press Play.")
                         )
@@ -130,14 +132,14 @@ final class ReaderViewModel: NSObject, ObservableObject, NSSpeechSynthesizerDele
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.plainText, .text]
+        panel.allowedContentTypes = [.plainText, .text, .pdf]
 
         guard panel.runModal() == .OK, let url = panel.url else {
             return
         }
 
         do {
-            let loadedText = try String(contentsOf: url, encoding: .utf8)
+            let loadedText = try Self.loadText(from: url)
             resetPlaybackState()
             sourceText = loadedText
             renderedText = Self.renderMarkdown(from: loadedText)
@@ -230,6 +232,23 @@ final class ReaderViewModel: NSObject, ObservableObject, NSSpeechSynthesizerDele
         }
 
         return result
+    }
+
+    private static func loadText(from url: URL) throws -> String {
+        if url.pathExtension.lowercased() == UTType.pdf.preferredFilenameExtension {
+            guard let document = PDFDocument(url: url) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            let extractedText = document.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !extractedText.isEmpty else {
+                throw CocoaError(.fileReadInapplicableStringEncoding)
+            }
+
+            return extractedText
+        }
+
+        return try String(contentsOf: url, encoding: .utf8)
     }
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, willSpeakWord characterRange: NSRange, of text: String) {
