@@ -33,6 +33,26 @@ struct ContentView: View {
 
                 Spacer()
 
+                HStack(spacing: 6) {
+                    Button {
+                        model.decreaseTextSize()
+                    } label: {
+                        Image(systemName: "minus.magnifyingglass")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Zoom out")
+                    .disabled(!model.canZoomOut)
+
+                    Button {
+                        model.increaseTextSize()
+                    } label: {
+                        Image(systemName: "plus.magnifyingglass")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Zoom in")
+                    .disabled(!model.canZoomIn)
+                }
+
                 if let fileName = model.fileName {
                     Text(fileName)
                         .font(.system(size: 12))
@@ -43,6 +63,7 @@ struct ContentView: View {
 
             ReaderTextView(
                 renderedText: model.renderedText,
+                fontSize: model.textSize,
                 cursorLocation: $model.cursorLocation,
                 spokenRange: $model.spokenRange,
                 onUserCursorMove: {
@@ -77,14 +98,27 @@ final class ReaderViewModel: NSObject, ObservableObject, NSSpeechSynthesizerDele
     @Published var cursorLocation = 0
     @Published var spokenRange: NSRange?
     @Published var statusMessage: String?
+    @Published private(set) var textSize: CGFloat = 22
     @Published private(set) var fileName: String?
     @Published private(set) var isSpeaking = false
 
     private var speechSynthesizer: NSSpeechSynthesizer?
     private var playbackStartOffset = 0
+    private var activeSynthesizerID: ObjectIdentifier?
+
+    private let minTextSize: CGFloat = 14
+    private let maxTextSize: CGFloat = 40
 
     var canPlay: Bool {
         !plainRenderedText.isEmpty
+    }
+
+    var canZoomIn: Bool {
+        textSize < maxTextSize
+    }
+
+    var canZoomOut: Bool {
+        textSize > minTextSize
     }
 
     private var plainRenderedText: String {
@@ -104,7 +138,7 @@ final class ReaderViewModel: NSObject, ObservableObject, NSSpeechSynthesizerDele
 
         do {
             let loadedText = try String(contentsOf: url, encoding: .utf8)
-            stop()
+            resetPlaybackState()
             sourceText = loadedText
             renderedText = Self.renderMarkdown(from: loadedText)
             cursorLocation = 0
@@ -116,20 +150,22 @@ final class ReaderViewModel: NSObject, ObservableObject, NSSpeechSynthesizerDele
     }
 
     func playFromCursor() {
-        stop()
+        resetPlaybackState()
 
         let visibleText = plainRenderedText
         let safeIndex = max(0, min(cursorLocation, visibleText.count))
         let startIndex = visibleText.index(visibleText.startIndex, offsetBy: safeIndex)
-        let textToRead = String(visibleText[startIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let textToRead = String(visibleText[startIndex...])
 
-        guard !textToRead.isEmpty else {
+        guard textToRead.contains(where: { !$0.isWhitespace && !$0.isNewline }) else {
             statusMessage = "Nothing to read from the current cursor position."
             return
         }
 
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.delegate = self
+        let synthesizerID = ObjectIdentifier(synthesizer)
+        activeSynthesizerID = synthesizerID
 
         playbackStartOffset = safeIndex
         spokenRange = NSRange(location: safeIndex, length: 0)
@@ -139,6 +175,9 @@ final class ReaderViewModel: NSObject, ObservableObject, NSSpeechSynthesizerDele
             isSpeaking = true
             statusMessage = "Reading from character \(safeIndex + 1)"
         } else {
+            if activeSynthesizerID == synthesizerID {
+                activeSynthesizerID = nil
+            }
             statusMessage = "Could not start speech."
             isSpeaking = false
             spokenRange = nil
@@ -147,18 +186,30 @@ final class ReaderViewModel: NSObject, ObservableObject, NSSpeechSynthesizerDele
     }
 
     func stop() {
-        speechSynthesizer?.stopSpeaking()
-        speechSynthesizer = nil
-        isSpeaking = false
-        spokenRange = nil
+        resetPlaybackState()
+        statusMessage = "Stopped."
+    }
+
+    func increaseTextSize() {
+        textSize = min(textSize + 2, maxTextSize)
+    }
+
+    func decreaseTextSize() {
+        textSize = max(textSize - 2, minTextSize)
     }
 
     func handleUserCursorMove() {
-        guard isSpeaking else {
-            return
-        }
+        resetPlaybackState()
+        statusMessage = "Ready to read from character \(cursorLocation + 1)"
+    }
 
-        playFromCursor()
+    private func resetPlaybackState() {
+        let synthesizer = speechSynthesizer
+        activeSynthesizerID = nil
+        speechSynthesizer = nil
+        isSpeaking = false
+        spokenRange = nil
+        synthesizer?.stopSpeaking()
     }
 
     private static func renderMarkdown(from text: String) -> AttributedString {
@@ -182,6 +233,10 @@ final class ReaderViewModel: NSObject, ObservableObject, NSSpeechSynthesizerDele
     }
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, willSpeakWord characterRange: NSRange, of text: String) {
+        guard activeSynthesizerID == ObjectIdentifier(sender) else {
+            return
+        }
+
         spokenRange = NSRange(
             location: playbackStartOffset + characterRange.location,
             length: characterRange.length
@@ -189,9 +244,15 @@ final class ReaderViewModel: NSObject, ObservableObject, NSSpeechSynthesizerDele
     }
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finishedSpeaking: Bool) {
-        isSpeaking = false
+        guard activeSynthesizerID == ObjectIdentifier(sender) else {
+            return
+        }
+
+        activeSynthesizerID = nil
         speechSynthesizer = nil
+        isSpeaking = false
         spokenRange = nil
+
         if finishedSpeaking {
             statusMessage = "Finished reading."
         }
@@ -200,6 +261,7 @@ final class ReaderViewModel: NSObject, ObservableObject, NSSpeechSynthesizerDele
 
 struct ReaderTextView: NSViewRepresentable {
     let renderedText: AttributedString
+    let fontSize: CGFloat
     @Binding var cursorLocation: Int
     @Binding var spokenRange: NSRange?
     let onUserCursorMove: () -> Void
@@ -214,7 +276,7 @@ struct ReaderTextView: NSViewRepresentable {
         scrollView.hasHorizontalScroller = false
         scrollView.borderType = .bezelBorder
 
-        let textView = NSTextView()
+        let textView = CursorTextView(frame: .zero)
         textView.isEditable = false
         textView.isSelectable = true
         textView.isRichText = true
@@ -225,7 +287,7 @@ struct ReaderTextView: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
-        textView.textContainerInset = NSSize(width: 10, height: 12)
+        textView.textContainerInset = NSSize(width: 28, height: 12)
         textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = true
 
@@ -241,9 +303,13 @@ struct ReaderTextView: NSViewRepresentable {
 
         let visibleText = String(renderedText.characters)
         if textView.string != visibleText {
-            let nsAttributed = NSAttributedString(renderedText)
+            let nsAttributed = Self.scaledAttributedString(from: renderedText, fontSize: fontSize)
+            textView.textStorage?.setAttributedString(nsAttributed)
+        } else if context.coordinator.lastAppliedFontSize != fontSize {
+            let nsAttributed = Self.scaledAttributedString(from: renderedText, fontSize: fontSize)
             textView.textStorage?.setAttributedString(nsAttributed)
         }
+        context.coordinator.lastAppliedFontSize = fontSize
 
         if let spokenRange {
             let clampedRange = NSRange(
@@ -262,13 +328,67 @@ struct ReaderTextView: NSViewRepresentable {
                 textView.setSelectedRange(NSRange(location: clampedLocation, length: 0))
             }
         }
+
+        context.coordinator.updateCursorIndicator()
     }
 
+    private static func scaledAttributedString(from text: AttributedString, fontSize: CGFloat) -> NSAttributedString {
+        let mutable = NSMutableAttributedString(attributedString: NSAttributedString(text))
+        let wholeRange = NSRange(location: 0, length: mutable.length)
+        let fallbackFont = NSFont.systemFont(ofSize: fontSize)
+
+        if mutable.length > 0 {
+            mutable.enumerateAttribute(.font, in: wholeRange) { value, range, _ in
+                let currentFont = (value as? NSFont) ?? fallbackFont
+                let descriptor = currentFont.fontDescriptor
+                let resizedFont = NSFont(descriptor: descriptor, size: fontSize) ?? fallbackFont
+                mutable.addAttribute(.font, value: resizedFont, range: range)
+            }
+        } else {
+            mutable.addAttribute(.font, value: fallbackFont, range: wholeRange)
+        }
+
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineHeightMultiple = 1.15
+        mutable.addAttribute(.paragraphStyle, value: paragraphStyle, range: wholeRange)
+
+        return mutable
+    }
+
+    final class CursorTextView: NSTextView {
+        let cursorIndicator = NSView()
+
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            configureCursorIndicator()
+        }
+
+        override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
+            super.init(frame: frameRect, textContainer: container)
+            configureCursorIndicator()
+        }
+
+        required init?(coder: NSCoder) {
+            super.init(coder: coder)
+            configureCursorIndicator()
+        }
+
+        private func configureCursorIndicator() {
+            cursorIndicator.wantsLayer = true
+            cursorIndicator.layer?.backgroundColor = NSColor.systemRed.cgColor
+            cursorIndicator.layer?.cornerRadius = 1.5
+            cursorIndicator.isHidden = true
+            addSubview(cursorIndicator)
+        }
+    }
+
+    @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         @Binding var cursorLocation: Int
         let onUserCursorMove: () -> Void
-        weak var textView: NSTextView?
+        weak var textView: CursorTextView?
         var isApplyingProgrammaticSelection = false
+        var lastAppliedFontSize: CGFloat = 0
 
         init(cursorLocation: Binding<Int>, onUserCursorMove: @escaping () -> Void) {
             _cursorLocation = cursorLocation
@@ -284,10 +404,75 @@ struct ReaderTextView: NSViewRepresentable {
 
             if isApplyingProgrammaticSelection {
                 isApplyingProgrammaticSelection = false
+                updateCursorIndicator()
                 return
             }
 
+            updateCursorIndicator()
             onUserCursorMove()
+        }
+
+        func updateCursorIndicator() {
+            guard let textView else {
+                return
+            }
+
+            let selection = textView.selectedRange()
+            guard selection.length <= 1 else {
+                textView.cursorIndicator.isHidden = true
+                return
+            }
+
+            let characterIndex = min(selection.location, textView.string.count)
+
+            guard
+                let layoutManager = textView.layoutManager,
+                textView.textContainer != nil
+            else {
+                textView.cursorIndicator.isHidden = true
+                return
+            }
+
+            guard layoutManager.numberOfGlyphs > 0 else {
+                textView.cursorIndicator.isHidden = true
+                return
+            }
+
+            let targetIndex = max(0, min(characterIndex, max(textView.string.count - 1, 0)))
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: NSRange(location: targetIndex, length: 0),
+                actualCharacterRange: nil
+            )
+            let glyphIndex = max(0, min(glyphRange.location, max(layoutManager.numberOfGlyphs - 1, 0)))
+            var lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            var glyphRect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyphIndex, length: 1), in: textView.textContainer!)
+
+            if characterIndex == textView.string.count, characterIndex > 0 {
+                let previousRange = NSRange(location: characterIndex - 1, length: 1)
+                let previousGlyphRange = layoutManager.glyphRange(forCharacterRange: previousRange, actualCharacterRange: nil)
+                lineRect = layoutManager.lineFragmentRect(forGlyphAt: previousGlyphRange.location, effectiveRange: nil)
+                glyphRect = layoutManager.boundingRect(forGlyphRange: NSRange(location: previousGlyphRange.location, length: 1), in: textView.textContainer!)
+            }
+
+            lineRect.origin.x += textView.textContainerOrigin.x
+            lineRect.origin.y += textView.textContainerOrigin.y
+            glyphRect.origin.x += textView.textContainerOrigin.x
+            glyphRect.origin.y += textView.textContainerOrigin.y
+
+            guard lineRect.intersects(textView.visibleRect) || characterIndex == 0 else {
+                textView.cursorIndicator.isHidden = true
+                return
+            }
+
+            let indicatorWidth: CGFloat = 4
+            let indicatorHeight = max(glyphRect.height, lineRect.height - 4, 18)
+            textView.cursorIndicator.frame = NSRect(
+                x: max(textView.textContainerOrigin.x, glyphRect.minX - 1),
+                y: glyphRect.minY + max((glyphRect.height - indicatorHeight) / 2, -1),
+                width: indicatorWidth,
+                height: indicatorHeight
+            )
+            textView.cursorIndicator.isHidden = false
         }
     }
 }
